@@ -10,6 +10,7 @@ contract Marketplace {
         bool isSold;
         uint orderStatus; 
         address buyer; 
+        address seller;
     }
 
    
@@ -24,7 +25,7 @@ contract Marketplace {
     // 添加商品
     function addProduct(string memory _name, string memory _image, uint _price) public {
         productCount++;
-        products[productCount] = Product(productCount, _name, _image, _price, false, 0, address(0));
+        products[productCount] = Product(productCount, _name, _image, _price, false, 0, address(0), msg.sender);
         emit ProductAdded(productCount, _name, _image, _price);
     }
 
@@ -32,11 +33,14 @@ contract Marketplace {
     function purchaseProduct(uint _id) public payable {
         Product storage product = products[_id];
         require(_id > 0 && _id <= productCount, "Invalid product ID");
-        require(msg.value >= product.price, "Insufficient funds");
+        require(msg.value == product.price, "Incorrect purchase amount");
         require(!product.isSold, "Product already sold");
 
         product.isSold = true;
         product.buyer = msg.sender;
+
+        (bool payoutSucceeded, ) = payable(product.seller).call{value: msg.value}("");
+        require(payoutSucceeded, "Seller payout failed");
 
         emit ProductPurchased(_id, msg.sender);
     }
@@ -44,10 +48,11 @@ contract Marketplace {
     // 修改订单状态
     function updateOrderStatus(uint _id, uint _status) public {
         require(_id > 0 && _id <= productCount, "Invalid product ID");
-        require(_status >= 0 && _status <= 2, "Invalid status");
+        require(_status <= 2, "Invalid status");
 
         Product storage product = products[_id];
         require(product.isSold, "Product not yet sold");
+        require(msg.sender == product.seller, "Only seller can update order status");
 
         product.orderStatus = _status;
 

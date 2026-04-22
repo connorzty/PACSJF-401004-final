@@ -1,22 +1,32 @@
 import Web3 from 'web3';
 
-let web3;
+let web3Instance;
 
-if (window.ethereum) {
-    web3 = new Web3(window.ethereum);
-    try {
-        // 请求用户授权
-        window.ethereum.request({ method: 'eth_requestAccounts' });
-    } catch (error) {
-        console.error("User denied account access");
+export function getWeb3() {
+    if (web3Instance) {
+        return web3Instance;
     }
-} else if (window.web3) {
-    // 如果已安装MetaMask则使用其提供的Web3实例
-    web3 = new Web3(window.web3.currentProvider);
-} else {
-    // 如果没有安装MetaMask，使用本地的HTTP provider连接
-    const provider = new Web3.providers.HttpProvider("http://localhost:7545");
-    web3 = new Web3(provider);
+
+    if (typeof window !== 'undefined' && window.ethereum) {
+        web3Instance = new Web3(window.ethereum);
+        return web3Instance;
+    }
+
+    if (typeof window !== 'undefined' && window.web3) {
+        web3Instance = new Web3(window.web3.currentProvider);
+        return web3Instance;
+    }
+
+    web3Instance = new Web3('http://127.0.0.1:7545');
+    return web3Instance;
 }
 
-export default web3;
+export async function requestAccounts() {
+    const web3 = getWeb3();
+
+    if (typeof window !== 'undefined' && window.ethereum) {
+        await window.ethereum.request({ method: 'eth_requestAccounts' });
+    }
+
+    return web3.eth.getAccounts();
+}

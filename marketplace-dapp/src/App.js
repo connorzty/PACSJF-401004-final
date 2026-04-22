@@ -1,37 +1,109 @@
-
 import React, { useEffect, useState } from 'react';
-import { BrowserRouter as Router, Route, Routes, Link } from 'react-router-dom'; // 注意这里的改动
-import web3 from './web3';
-import MarketplaceABI from './Marketplace.json';
+import { BrowserRouter as Router, Route, Routes, Link } from 'react-router-dom';
 import JSZip from 'jszip';
+import { getWeb3, requestAccounts } from './web3';
+import { getMarketplaceContract } from './marketplaceContract';
+import { IPFS_GATEWAY_URL, uploadToIPFS as uploadPackageToIPFS } from './ipfsUpload';
 
-const contractAddress = '0x989A33f7D7030977ED2Bc434C23BcCdcabB2127a'; // 替换为你部署的合约地址
-const Marketplace = new web3.eth.Contract(MarketplaceABI.abi, contractAddress);
-const ipfsGateway = 'https://along-known-struck.quicknode-ipfs.com/ipfs/'; // 替换为你的IPFS网关
+const activeIpfsGateway = IPFS_GATEWAY_URL;
 
 function App() {
     return (
         <Router>
             <Navigation />
-            <Routes> {/* 将 Switch 替换为 Routes */}
-                <Route path="/" element={<Home />} /> {/* 使用 element 属性 */}
-                <Route path="/add-product" element={<AddProduct />} /> {/* 新增的添加商品页面 */}
+            <Routes>
+                <Route path="/" element={<Home />} />
+                <Route path="/add-product" element={<AddProduct />} />
                 <Route path="/manage-shipping" element={<ManageShipping />} />
-                <Route path="/purchased-orders" element={<PurchasedOrders />} /> {/* 新增的订单页面 */}
+                <Route path="/purchased-orders" element={<PurchasedOrders />} />
             </Routes>
         </Router>
     );
 }
 
-function Navigation() {
+export function Navigation() {
     return (
         <nav style={{ padding: '10px', backgroundColor: '#f5f5f5' }}>
-            <Link to="/" style={{ marginRight: '20px' }}>Home</Link>
-            <Link to="/add-product" style={{ marginRight: '20px' }}>Add Product</Link> {/* 添加商品页面链接 */}
-            <Link to="/manage-shipping" style={{ marginRight: '20px' }}>Manage Shipping</Link>
-            <Link to="/purchased-orders" style={{ marginRight: '20px' }}>Purchased Orders</Link> {/* 订单页面链接 */}
+            <Link to="/" style={{ marginRight: '20px' }}>
+                Home
+            </Link>
+            <Link to="/add-product" style={{ marginRight: '20px' }}>
+                Add Product
+            </Link>
+            <Link to="/manage-shipping" style={{ marginRight: '20px' }}>
+                Manage Shipping
+            </Link>
+            <Link to="/purchased-orders" style={{ marginRight: '20px' }}>
+                Purchased Orders
+            </Link>
         </nav>
     );
+}
+
+async function loadMarketplaceClient() {
+    const [accounts, marketplace] = await Promise.all([requestAccounts(), getMarketplaceContract()]);
+
+    if (!accounts.length) {
+        throw new Error('No wallet account is connected.');
+    }
+
+    return {
+        account: accounts[0],
+        marketplace,
+    };
+}
+
+function formatPrice(price) {
+    return getWeb3().utils.fromWei(price, 'ether');
+}
+
+function getOrderStatusText(status) {
+    switch (parseInt(status, 10)) {
+        case 0:
+            return 'Not Shipped';
+        case 1:
+            return 'Shipped';
+        case 2:
+            return 'Delivered';
+        default:
+            return 'Unknown';
+    }
+}
+
+async function fetchProductDetails(product) {
+    try {
+        const response = await fetch(`${activeIpfsGateway}${product.image}`);
+        if (!response.ok) {
+            throw new Error(`Failed to fetch from IPFS: ${response.statusText}`);
+        }
+
+        const blob = await response.blob();
+        if (blob.type !== 'application/zip') {
+            return {
+                ...product,
+                description: 'No description available for this file type.',
+                imageUrl: URL.createObjectURL(blob),
+            };
+        }
+
+        const zip = await JSZip.loadAsync(blob);
+        const descriptionFile = zip.file('description.txt');
+        const imageFileName = Object.keys(zip.files).find((name) => name !== 'description.txt');
+        const imageFile = imageFileName ? zip.file(imageFileName) : null;
+
+        return {
+            ...product,
+            description: descriptionFile ? await descriptionFile.async('string') : 'No description available.',
+            imageUrl: imageFile ? URL.createObjectURL(await imageFile.async('blob')) : null,
+        };
+    } catch (error) {
+        console.error(`Error fetching product ${product.id} details:`, error);
+        return {
+            ...product,
+            description: 'Failed to load description.',
+            imageUrl: null,
+        };
+    }
 }
 
 function Home() {
@@ -41,113 +113,65 @@ function Home() {
     const [error, setError] = useState(null);
 
     useEffect(() => {
+        let cancelled = false;
+
         const loadBlockchainData = async () => {
             setLoading(true);
-            try {
-                const accounts = await web3.eth.getAccounts();
-                setAccount(accounts[0]);
+            setError(null);
 
-                const productCount = await Marketplace.methods.productCount().call();
+            try {
+                const { account: connectedAccount, marketplace } = await loadMarketplaceClient();
+                const productCount = Number(await marketplace.methods.productCount().call());
                 const loadedProducts = [];
 
-                // for (let i = 1; i <= productCount; i++) {
-                //     const product = await Marketplace.methods.products(i).call();
-                //     const detailedProduct = await fetchProductDetails(product);
-                //     loadedProducts.push(detailedProduct);
-                // }
-                for (let i = 1; i <= productCount; i++) {
-                    const product = await Marketplace.methods.products(i).call();
-                    if (!product.isSold) { // 只显示未售出的商品
-                        const detailedProduct = await fetchProductDetails(product);
-                        loadedProducts.push(detailedProduct);
+                for (let i = 1; i <= productCount; i += 1) {
+                    const product = await marketplace.methods.products(i).call();
+                    if (!product.isSold) {
+                        loadedProducts.push(await fetchProductDetails(product));
                     }
                 }
 
-                setProducts(loadedProducts);
-            } catch (err) {
-                console.error('Error loading blockchain data:', err);
-                setError('Failed to load products. Please try again later.');
+                if (!cancelled) {
+                    setAccount(connectedAccount);
+                    setProducts(loadedProducts);
+                }
+            } catch (loadError) {
+                console.error('Error loading blockchain data:', loadError);
+                if (!cancelled) {
+                    setError(loadError.message || 'Failed to load products. Please try again later.');
+                }
+            } finally {
+                if (!cancelled) {
+                    setLoading(false);
+                }
             }
-            setLoading(false);
         };
 
         loadBlockchainData();
+        return () => {
+            cancelled = true;
+        };
     }, []);
-
-    const fetchProductDetails = async (product) => {
-        try {
-            const response = await fetch(`${ipfsGateway}${product.image}`);
-            if (!response.ok) {
-                throw new Error(`Failed to fetch from IPFS: ${response.statusText}`);
-            }
-            const blob = await response.blob();
-
-            if (blob.type === "application/zip") {
-                const zip = await JSZip.loadAsync(blob);
-                const descriptionFile = zip.file('description.txt');
-                const description = await descriptionFile.async('string');
-
-                const imageFileName = Object.keys(zip.files).find(
-                    (name) => name !== 'description.txt'
-                );
-                const imageFile = zip.file(imageFileName);
-                const imageBlob = await imageFile.async('blob');
-                const imageUrl = URL.createObjectURL(imageBlob);
-
-                return {
-                    ...product,
-                    description,
-                    imageUrl,
-                };
-            } else {
-                const imageUrl = URL.createObjectURL(blob);
-                return {
-                    ...product,
-                    description: 'No description available for this file type.',
-                    imageUrl,
-                };
-            }
-        } catch (err) {
-            console.error(`Error fetching product ${product.id} details:`, err);
-            return {
-                ...product,
-                description: 'Failed to load description.',
-                imageUrl: null,
-            };
-        }
-    };
 
     const handlePurchaseProduct = async (id, price) => {
         setLoading(true);
+
         try {
-            await Marketplace.methods.purchaseProduct(id).send({
-                from: account,
+            const { account: connectedAccount, marketplace } = await loadMarketplaceClient();
+            await marketplace.methods.purchaseProduct(id).send({
+                from: account || connectedAccount,
                 value: price,
             });
 
-            setProducts(
-                products.map((product) =>
-                    product.id === id ? { ...product, isSold: true } : product
-                )
+            setProducts((currentProducts) =>
+                currentProducts.filter((product) => String(product.id) !== String(id))
             );
             alert('Product purchased successfully!');
-        } catch (err) {
-            console.error('Error purchasing product:', err);
-            alert('Failed to purchase product. Please try again.');
-        }
-        setLoading(false);
-    };
-
-    const getOrderStatusText = (status) => {
-        switch (parseInt(status, 10)) {
-            case 0:
-                return 'Not Shipped';
-            case 1:
-                return 'Shipped';
-            case 2:
-                return 'Delivered';
-            default:
-                return 'Unknown';
+        } catch (purchaseError) {
+            console.error('Error purchasing product:', purchaseError);
+            alert(purchaseError.message || 'Failed to purchase product. Please try again.');
+        } finally {
+            setLoading(false);
         }
     };
 
@@ -211,26 +235,23 @@ function Home() {
                             {product.description || 'No description available.'}
                         </p>
                         <p>
-                            <strong>Price:</strong>{' '}
-                            {web3.utils.fromWei(product.price, 'ether')} COIN
+                            <strong>Price:</strong> {formatPrice(product.price)} COIN
                         </p>
-                        {!product.isSold && (
-                            <button
-                                onClick={() => handlePurchaseProduct(product.id, product.price)}
-                                style={{
-                                    padding: '10px 20px',
-                                    backgroundColor: '#4CAF50',
-                                    color: 'white',
-                                    border: 'none',
-                                    cursor: 'pointer',
-                                    width: '100%',
-                                    marginTop: '10px',
-                                }}
-                                disabled={loading}
-                            >
-                                Purchase
-                            </button>
-                        )}
+                        <button
+                            onClick={() => handlePurchaseProduct(product.id, product.price)}
+                            style={{
+                                padding: '10px 20px',
+                                backgroundColor: '#4CAF50',
+                                color: 'white',
+                                border: 'none',
+                                cursor: 'pointer',
+                                width: '100%',
+                                marginTop: '10px',
+                            }}
+                            disabled={loading}
+                        >
+                            Purchase
+                        </button>
                     </div>
                 ))}
             </div>
@@ -247,53 +268,28 @@ function AddProduct() {
     const [loading, setLoading] = useState(false);
 
     useEffect(() => {
+        let cancelled = false;
+
         const loadAccount = async () => {
-            const accounts = await web3.eth.getAccounts();
-            setAccount(accounts[0]);
+            try {
+                const { account: connectedAccount } = await loadMarketplaceClient();
+                if (!cancelled) {
+                    setAccount(connectedAccount);
+                }
+            } catch (loadError) {
+                console.error('Error loading account:', loadError);
+            }
         };
 
         loadAccount();
-    }, []);
-
-    const uploadToIPFS = async (file) => {
-        const apiKey = 'QN_4ae36340d8e94726846e89d67e823877'; // 替换为你的 QuickNode API Key
-        const url = 'https://api.quicknode.com/ipfs/rest/v1/s3/put-object';
-
-        const myHeaders = new Headers();
-        myHeaders.append("x-api-key", apiKey);
-
-        const formData = new FormData();
-        formData.append("Body", file);
-        formData.append("Key", file.name); // 使用文件名作为 Key
-        formData.append("ContentType", file.type); // 获取文件的 MIME 类型
-
-        const requestOptions = {
-            method: 'POST',
-            headers: myHeaders,
-            body: formData,
-            redirect: 'follow'
+        return () => {
+            cancelled = true;
         };
-
-        try {
-            const response = await fetch(url, requestOptions);
-            const result = await response.json(); // 确保解析 JSON 响应
-            console.log('IPFS Upload Response:', result);
-
-            if (result && result.pin && result.pin.cid) {
-                return result.pin.cid;
-            } else {
-                console.error('Invalid response from IPFS upload:', result);
-                return null;
-            }
-        } catch (error) {
-            console.error('Error uploading to IPFS:', error);
-            return null;
-        }
-    };
+    }, []);
 
     const handleFileChange = (event) => {
         const selectedFile = event.target.files[0];
-        setFile(selectedFile);
+        setFile(selectedFile || null);
     };
 
     const handleAddProduct = async () => {
@@ -304,34 +300,31 @@ function AddProduct() {
 
         setLoading(true);
         try {
+            const { account: connectedAccount, marketplace } = await loadMarketplaceClient();
+            const web3 = getWeb3();
             const zip = new JSZip();
+
             zip.file('description.txt', description);
             zip.file(file.name, file);
 
             const zipBlob = await zip.generateAsync({ type: 'blob' });
-            console.log('Generated ZIP Blob:', zipBlob);
+            const cid = await uploadPackageToIPFS(zipBlob);
 
-            const cid = await uploadToIPFS(zipBlob);
-            if (!cid) {
-                alert('Failed to upload package to IPFS. Please try again.');
-                setLoading(false);
-                return;
-            }
-
-            await Marketplace.methods
+            await marketplace.methods
                 .addProduct(name, cid, web3.utils.toWei(price, 'ether'))
-                .send({ from: account });
+                .send({ from: account || connectedAccount });
 
             setName('');
             setDescription('');
             setFile(null);
             setPrice('');
             alert('Product added successfully!');
-        } catch (err) {
-            console.error('Error adding product:', err);
-            alert('Failed to add product. Please try again.');
+        } catch (addError) {
+            console.error('Error adding product:', addError);
+            alert(addError.message || 'Failed to add product. Please try again.');
+        } finally {
+            setLoading(false);
         }
-        setLoading(false);
     };
 
     return (
@@ -342,21 +335,21 @@ function AddProduct() {
                     type="text"
                     placeholder="Product Name"
                     value={name}
-                    onChange={(e) => setName(e.target.value)}
+                    onChange={(event) => setName(event.target.value)}
                     style={{ width: '300px', padding: '8px', marginRight: '10px' }}
                 />
                 <input
                     type="text"
                     placeholder="Price"
                     value={price}
-                    onChange={(e) => setPrice(e.target.value)}
+                    onChange={(event) => setPrice(event.target.value)}
                     style={{ width: '200px', padding: '8px' }}
                 />
                 <br />
                 <textarea
                     placeholder="Product Description"
                     value={description}
-                    onChange={(e) => setDescription(e.target.value)}
+                    onChange={(event) => setDescription(event.target.value)}
                     style={{
                         width: '515px',
                         height: '100px',
@@ -398,66 +391,79 @@ function ManageShipping() {
     const [error, setError] = useState(null);
 
     useEffect(() => {
+        let cancelled = false;
+
         const loadBlockchainData = async () => {
             setLoading(true);
-            try {
-                const accounts = await web3.eth.getAccounts();
-                setAccount(accounts[0]);
+            setError(null);
 
-                const productCount = await Marketplace.methods.productCount().call();
+            try {
+                const { account: connectedAccount, marketplace } = await loadMarketplaceClient();
+                const productCount = Number(await marketplace.methods.productCount().call());
                 const loadedProducts = [];
 
-                for (let i = 1; i <= productCount; i++) {
-                    const product = await Marketplace.methods.products(i).call();
-
-                    if (product.isSold) { // 只加载已售出的商品
+                for (let i = 1; i <= productCount; i += 1) {
+                    const product = await marketplace.methods.products(i).call();
+                    if (
+                        product.isSold &&
+                        product.seller?.toLowerCase() === connectedAccount.toLowerCase()
+                    ) {
                         loadedProducts.push(product);
                     }
                 }
 
-                setProducts(loadedProducts);
-            } catch (err) {
-                console.error('Error loading blockchain data:', err);
-                setError('Failed to load products. Please try again later.');
+                if (!cancelled) {
+                    setAccount(connectedAccount);
+                    setProducts(loadedProducts);
+                }
+            } catch (loadError) {
+                console.error('Error loading blockchain data:', loadError);
+                if (!cancelled) {
+                    setError(loadError.message || 'Failed to load products. Please try again later.');
+                }
+            } finally {
+                if (!cancelled) {
+                    setLoading(false);
+                }
             }
-            setLoading(false);
         };
 
         loadBlockchainData();
+        return () => {
+            cancelled = true;
+        };
     }, []);
 
     const handleUpdateStatus = async (id, newStatus) => {
         setLoading(true);
         try {
-            await Marketplace.methods.updateOrderStatus(id, newStatus).send({ from: account });
+            const { account: connectedAccount, marketplace } = await loadMarketplaceClient();
+            await marketplace.methods
+                .updateOrderStatus(id, newStatus)
+                .send({ from: account || connectedAccount });
+
             alert('Order status updated successfully!');
-
-            setProducts(products.map((product) => 
-                product.id === id ? { ...product, orderStatus: newStatus } : product
-            ));
-        } catch (err) {
-            console.error('Error updating order status:', err);
-            alert('Failed to update order status. Please try again.');
-        }
-        setLoading(false);
-    };
-
-    const getOrderStatusText = (status) => {
-        switch (parseInt(status, 10)) {
-            case 0:
-                return 'Not Shipped';
-            case 1:
-                return 'Shipped';
-            case 2:
-                return 'Delivered';
-            default:
-                return 'Unknown';
+            setProducts((currentProducts) =>
+                currentProducts.map((product) =>
+                    String(product.id) === String(id)
+                        ? { ...product, orderStatus: newStatus }
+                        : product
+                )
+            );
+        } catch (updateError) {
+            console.error('Error updating order status:', updateError);
+            alert(updateError.message || 'Failed to update order status. Please try again.');
+        } finally {
+            setLoading(false);
         }
     };
 
     return (
         <div style={{ padding: '20px' }}>
             <h1>Manage Shipping Status</h1>
+            <p>
+                <strong>Connected account:</strong> {account}
+            </p>
             {loading && <p>Loading products...</p>}
             {error && <p style={{ color: 'red' }}>{error}</p>}
             <div
@@ -480,7 +486,10 @@ function ManageShipping() {
                     >
                         <h3>{product.name}</h3>
                         <p>
-                            <strong>Price:</strong> {web3.utils.fromWei(product.price, 'ether')} COIN
+                            <strong>Buyer:</strong> {product.buyer}
+                        </p>
+                        <p>
+                            <strong>Price:</strong> {formatPrice(product.price)} COIN
                         </p>
                         <p>
                             <strong>Order Status:</strong> {getOrderStatusText(product.orderStatus)}
@@ -528,80 +537,54 @@ function PurchasedOrders() {
     const [error, setError] = useState(null);
 
     useEffect(() => {
+        let cancelled = false;
+
         const loadPurchasedProducts = async () => {
             setLoading(true);
-            try {
-                const accounts = await web3.eth.getAccounts();
-                setAccount(accounts[0]);
+            setError(null);
 
-                const productCount = await Marketplace.methods.productCount().call();
+            try {
+                const { account: connectedAccount, marketplace } = await loadMarketplaceClient();
+                const productCount = Number(await marketplace.methods.productCount().call());
                 const loadedProducts = [];
 
-                for (let i = 1; i <= productCount; i++) {
-                    const product = await Marketplace.methods.products(i).call();
-                    if (product.buyer.toLowerCase() === accounts[0].toLowerCase()) {
-                        const detailedProduct = await fetchProductDetails(product);
-                        loadedProducts.push(detailedProduct);
+                for (let i = 1; i <= productCount; i += 1) {
+                    const product = await marketplace.methods.products(i).call();
+                    if (product.buyer?.toLowerCase() === connectedAccount.toLowerCase()) {
+                        loadedProducts.push(await fetchProductDetails(product));
                     }
                 }
 
-                setPurchasedProducts(loadedProducts);
-            } catch (err) {
-                console.error('Error loading purchased products:', err);
-                setError('Failed to load purchased products. Please try again later.');
+                if (!cancelled) {
+                    setAccount(connectedAccount);
+                    setPurchasedProducts(loadedProducts);
+                }
+            } catch (loadError) {
+                console.error('Error loading purchased products:', loadError);
+                if (!cancelled) {
+                    setError(
+                        loadError.message || 'Failed to load purchased products. Please try again later.'
+                    );
+                }
+            } finally {
+                if (!cancelled) {
+                    setLoading(false);
+                }
             }
-            setLoading(false);
         };
 
         loadPurchasedProducts();
+        return () => {
+            cancelled = true;
+        };
     }, []);
-
-    const fetchProductDetails = async (product) => {
-        try {
-            const response = await fetch(`${ipfsGateway}${product.image}`);
-            if (!response.ok) {
-                throw new Error(`Failed to fetch from IPFS: ${response.statusText}`);
-            }
-            const blob = await response.blob();
-
-            if (blob.type === "application/zip") {
-                const zip = await JSZip.loadAsync(blob);
-                const descriptionFile = zip.file('description.txt');
-                const description = await descriptionFile.async('string');
-
-                const imageFileName = Object.keys(zip.files).find(
-                    (name) => name !== 'description.txt'
-                );
-                const imageFile = zip.file(imageFileName);
-                const imageBlob = await imageFile.async('blob');
-                const imageUrl = URL.createObjectURL(imageBlob);
-
-                return {
-                    ...product,
-                    description,
-                    imageUrl,
-                };
-            } else {
-                const imageUrl = URL.createObjectURL(blob);
-                return {
-                    ...product,
-                    description: 'No description available for this file type.',
-                    imageUrl,
-                };
-            }
-        } catch (err) {
-            console.error(`Error fetching product ${product.id} details:`, err);
-            return {
-                ...product,
-                description: 'Failed to load description.',
-                imageUrl: null,
-            };
-        }
-    };
 
     return (
         <div style={{ padding: '20px' }}>
             <h1>Purchased Orders</h1>
+            <p>
+                <strong>Connected account:</strong> {account}
+            </p>
             {loading && <p>Loading purchased products...</p>}
             {error && <p style={{ color: 'red' }}>{error}</p>}
             <div
@@ -654,12 +637,10 @@ function PurchasedOrders() {
                             {product.description || 'No description available.'}
                         </p>
                         <p>
-                            <strong>Price:</strong>{' '}
-                            {web3.utils.fromWei(product.price, 'ether')} COIN
+                            <strong>Price:</strong> {formatPrice(product.price)} COIN
                         </p>
                         <p>
-                            <strong>Order Status:</strong>{' '}
-                            {getOrderStatusText(product.orderStatus)}
+                            <strong>Order Status:</strong> {getOrderStatusText(product.orderStatus)}
                         </p>
                     </div>
                 ))}
@@ -667,18 +648,5 @@ function PurchasedOrders() {
         </div>
     );
 }
-
-const getOrderStatusText = (status) => {
-    switch (parseInt(status, 10)) {
-        case 0:
-            return 'Not Shipped';
-        case 1:
-            return 'Shipped';
-        case 2:
-            return 'Delivered';
-        default:
-            return 'Unknown';
-    }
-};
 
 export default App;
